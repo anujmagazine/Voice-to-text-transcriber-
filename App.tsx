@@ -4,31 +4,9 @@ import { GoogleGenAI, Modality } from '@google/genai';
 import { IdeaSnippet, TranscriptionState } from './types';
 import { encodePCM } from './utils/audioUtils';
 
-// Icons as components
-const MicrophoneIcon = () => (
-  <svg xmlns="http://www.w3.org/2000/svg" className="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
-  </svg>
-);
-
-const StopIcon = () => (
-  <svg xmlns="http://www.w3.org/2000/svg" className="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 10h6v4H9z" />
-  </svg>
-);
-
-const CopyIcon = () => (
-  <svg xmlns="http://www.w3.org/2000/svg" className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3" />
-  </svg>
-);
-
-const TrashIcon = () => (
-  <svg xmlns="http://www.w3.org/2000/svg" className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-  </svg>
-);
+// Constants
+const SAMPLE_RATE = 16000;
+const BUFFER_SIZE = 4096;
 
 export default function App() {
   const [state, setState] = useState<TranscriptionState>({
@@ -37,50 +15,49 @@ export default function App() {
     isRecording: false,
     status: 'idle',
   });
+  
   const [toast, setToast] = useState<string | null>(null);
+  const [voulmeLevel, setVolumeLevel] = useState(0);
 
+  // Refs for non-reactive state
   const sessionRef = useRef<any>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const transcriptionBuffer = useRef<string>('');
   const historyContainerRef = useRef<HTMLDivElement>(null);
+  
+  // Accumulated transcription refs
+  const currentTurnText = useRef<string>('');
+  const lastFinalizedText = useRef<string>('');
 
-  // Auto-scroll history when new items added
+  // Auto-scroll when transcription updates
   useEffect(() => {
     if (historyContainerRef.current) {
       historyContainerRef.current.scrollTop = historyContainerRef.current.scrollHeight;
     }
   }, [state.history, state.currentText]);
 
-  // Toast auto-hide
-  useEffect(() => {
-    if (toast) {
-      const timer = setTimeout(() => setToast(null), 2000);
-      return () => clearTimeout(timer);
-    }
-  }, [toast]);
-
-  const stopListening = useCallback(async () => {
+  const cleanup = useCallback(async () => {
     if (sessionRef.current) {
-      sessionRef.current.close?.();
+      try { sessionRef.current.close(); } catch (e) {}
       sessionRef.current = null;
     }
-
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(track => track.stop());
       streamRef.current = null;
     }
-
     if (audioContextRef.current) {
-      await audioContextRef.current.close();
+      try { await audioContextRef.current.close(); } catch (e) {}
       audioContextRef.current = null;
     }
+    setVolumeLevel(0);
+  }, []);
 
-    // Move current text to history if it's not empty
-    if (transcriptionBuffer.current.trim()) {
+  const stopSession = useCallback(async () => {
+    // Save current buffer if exists
+    if (currentTurnText.current.trim()) {
       const newSnippet: IdeaSnippet = {
         id: crypto.randomUUID(),
-        text: transcriptionBuffer.current.trim(),
+        text: currentTurnText.current.trim(),
         timestamp: new Date(),
       };
       setState(prev => ({
@@ -90,46 +67,54 @@ export default function App() {
         isRecording: false,
         status: 'idle'
       }));
-      transcriptionBuffer.current = '';
     } else {
-      setState(prev => ({
-        ...prev,
-        currentText: '',
-        isRecording: false,
-        status: 'idle'
-      }));
+      setState(prev => ({ ...prev, currentText: '', isRecording: false, status: 'idle' }));
     }
-  }, []);
+    
+    currentTurnText.current = '';
+    lastFinalizedText.current = '';
+    await cleanup();
+  }, [cleanup]);
 
-  const startListening = async () => {
+  const startSession = async () => {
     try {
-      setState(prev => ({ ...prev, status: 'connecting', isRecording: true }));
-      
+      setState(prev => ({ ...prev, status: 'connecting', isRecording: true, currentText: '' }));
+      currentTurnText.current = '';
+      lastFinalizedText.current = '';
+
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
       
+      // 1. Get Microphone Access
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
 
-      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+      // 2. Setup Audio Context
+      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: SAMPLE_RATE });
       audioContextRef.current = audioContext;
 
+      // 3. Connect to Gemini Live API
       const sessionPromise = ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-12-2025',
         config: {
           responseModalities: [Modality.AUDIO],
           inputAudioTranscription: {},
-          // Refined instruction to prevent language drift and ensure English transcription when spoken.
-          systemInstruction: "You are a professional transcriptionist. Transcribe the user's speech exactly as spoken in its original language. If the user speaks English, use only English characters and words. Do not translate the speech. Do not switch to Hindi or any other language unless the user explicitly speaks in that language. Only provide the text transcription, no conversational responses or summaries.",
+          systemInstruction: "You are a specialized transcription service. \n\nRULES:\n1. Transcribe the user's audio into English text ONLY.\n2. Do NOT use any other language or script (No Hindi).\n3. If you hear non-English, attempt to transcribe it phonetically in English.\n4. Provide verbatim transcription. No summaries, no conversational filler.\n5. Output text immediately as it is recognized.",
         },
         callbacks: {
           onopen: () => {
             setState(prev => ({ ...prev, status: 'listening' }));
             
             const source = audioContext.createMediaStreamSource(stream);
-            const scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+            const scriptProcessor = audioContext.createScriptProcessor(BUFFER_SIZE, 1, 1);
             
             scriptProcessor.onaudioprocess = (e) => {
               const inputData = e.inputBuffer.getChannelData(0);
+              
+              // Simple volume analysis for the visualizer
+              let sum = 0;
+              for(let i=0; i<inputData.length; i++) sum += inputData[i] * inputData[i];
+              setVolumeLevel(Math.sqrt(sum / inputData.length));
+
               const pcmData = encodePCM(inputData);
               sessionPromise.then(session => {
                 session.sendRealtimeInput({
@@ -140,18 +125,38 @@ export default function App() {
             
             source.connect(scriptProcessor);
             scriptProcessor.connect(audioContext.destination);
+            
+            if (audioContext.state === 'suspended') audioContext.resume();
           },
-          onmessage: (message) => {
+          onmessage: (message: any) => {
+            // Real-time transcription segment
             if (message.serverContent?.inputTranscription) {
-              const text = message.serverContent.inputTranscription.text;
-              transcriptionBuffer.current += text;
-              setState(prev => ({ ...prev, currentText: transcriptionBuffer.current }));
+              const textDelta = message.serverContent.inputTranscription.text;
+              currentTurnText.current += textDelta;
+              setState(prev => ({ ...prev, currentText: currentTurnText.current }));
+            }
+            
+            // Turn completion detection (natural pause)
+            if (message.serverContent?.turnComplete) {
+              if (currentTurnText.current.trim()) {
+                const textToSave = currentTurnText.current.trim();
+                setState(prev => ({
+                  ...prev,
+                  history: [...prev.history, {
+                    id: crypto.randomUUID(),
+                    text: textToSave,
+                    timestamp: new Date(),
+                  }],
+                  currentText: ''
+                }));
+                currentTurnText.current = '';
+              }
             }
           },
           onerror: (e) => {
-            console.error('Gemini error:', e);
+            console.error('Gemini Live API Error:', e);
             setState(prev => ({ ...prev, status: 'error' }));
-            stopListening();
+            stopSession();
           },
           onclose: () => {
             setState(prev => ({ ...prev, status: 'idle', isRecording: false }));
@@ -161,157 +166,123 @@ export default function App() {
 
       sessionRef.current = await sessionPromise;
     } catch (err) {
-      console.error('Failed to start listening:', err);
+      console.error('Initialization Error:', err);
       setState(prev => ({ ...prev, status: 'error', isRecording: false }));
+      cleanup();
     }
   };
 
-  const copyToClipboard = (text: string) => {
+  const copyText = (text: string) => {
     navigator.clipboard.writeText(text);
-    setToast('Copied to clipboard');
-  };
-
-  const clearHistory = () => {
-    if (confirm('Clear all captured ideas?')) {
-      setState(prev => ({ ...prev, history: [] }));
-      setToast('History cleared');
-    }
-  };
-
-  const copyAll = () => {
-    const allText = state.history.map(h => `[${h.timestamp.toLocaleTimeString()}] ${h.text}`).join('\n\n');
-    copyToClipboard(allText);
+    setToast('Copied');
+    setTimeout(() => setToast(null), 2000);
   };
 
   return (
-    <div className="flex flex-col h-screen max-w-2xl mx-auto px-4 pt-6 pb-24 overflow-hidden bg-slate-900 text-slate-100">
+    <div className="flex flex-col h-screen max-w-2xl mx-auto px-4 pt-6 pb-24 overflow-hidden bg-[#0a0a0c] text-slate-100 font-sans">
       {/* Header */}
-      <header className="flex justify-between items-center mb-6 shrink-0">
+      <header className="flex justify-between items-center mb-8 shrink-0">
         <div>
-          <h1 className="text-2xl font-bold bg-gradient-to-r from-blue-400 to-indigo-400 bg-clip-text text-transparent">
-            IdeaFlow
+          <h1 className="text-3xl font-black tracking-tighter text-white">
+            IDEA<span className="text-indigo-500">FLOW</span>
           </h1>
-          <p className="text-xs text-slate-400">Capture your thoughts hands-free</p>
+          <div className="flex items-center gap-2 mt-1">
+            <span className={`w-2 h-2 rounded-full ${state.isRecording ? 'bg-green-500 animate-pulse' : 'bg-slate-700'}`}></span>
+            <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">
+              {state.status === 'listening' ? 'Streaming Audio (English)' : state.status === 'connecting' ? 'Connecting...' : 'Mic Ready'}
+            </span>
+          </div>
         </div>
-        <div className="flex gap-2">
-          {state.history.length > 0 && (
-            <>
-              <button 
-                onClick={copyAll}
-                className="p-2 bg-slate-800 hover:bg-slate-700 rounded-lg transition-colors border border-slate-700 text-slate-300"
-                title="Copy All"
-              >
-                <CopyIcon />
-              </button>
-              <button 
-                onClick={clearHistory}
-                className="p-2 bg-slate-800 hover:bg-red-900/40 rounded-lg transition-colors border border-slate-700 hover:border-red-500/50 text-slate-300"
-                title="Clear All"
-              >
-                <TrashIcon />
-              </button>
-            </>
-          )}
-        </div>
+        {state.history.length > 0 && (
+          <button 
+            onClick={() => { if(confirm('Clear history?')) setState(prev => ({ ...prev, history: [] })) }}
+            className="p-2 text-slate-600 hover:text-red-500 transition-colors"
+          >
+            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+          </button>
+        )}
       </header>
 
-      {/* Main Content Area */}
-      <main className="flex-1 overflow-y-auto space-y-4 pr-1 scroll-smooth" ref={historyContainerRef}>
+      {/* Main Stream */}
+      <main className="flex-1 overflow-y-auto space-y-6 pr-2 scroll-smooth" ref={historyContainerRef}>
         {state.history.length === 0 && !state.isRecording && (
-          <div className="h-full flex flex-col items-center justify-center text-center p-8 space-y-4">
-            <div className="w-20 h-20 bg-slate-800/50 rounded-full flex items-center justify-center border border-slate-700 text-slate-400">
-              <MicrophoneIcon />
+          <div className="h-full flex flex-col items-center justify-center text-center opacity-30">
+            <div className="w-20 h-20 mb-6 flex items-center justify-center rounded-full border border-slate-700">
+              <svg className="w-10 h-10" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" /></svg>
             </div>
-            <h2 className="text-xl font-medium text-slate-300">No ideas yet</h2>
-            <p className="text-slate-500 max-w-xs">
-              Tap the button below and start speaking. Your ideas will be transcribed in real-time.
-            </p>
+            <p className="text-sm tracking-wide">Capture ideas hands-free while driving</p>
           </div>
         )}
 
+        {/* Saved History */}
         {state.history.map((snippet) => (
-          <div key={snippet.id} className="group relative bg-slate-800/40 border border-slate-700/50 rounded-2xl p-4 shadow-sm hover:shadow-md transition-shadow">
-            <div className="flex justify-between items-start mb-2">
-              <span className="text-[10px] font-mono text-slate-500 tracking-wider uppercase">
-                {snippet.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-              </span>
-              <button 
-                onClick={() => copyToClipboard(snippet.text)}
-                className="opacity-0 group-hover:opacity-100 p-1.5 text-slate-400 hover:text-white transition-all bg-slate-700/50 rounded-lg"
-              >
-                <CopyIcon />
+          <div key={snippet.id} className="relative bg-[#151518] border border-slate-800/60 rounded-3xl p-6 group transition-all hover:border-slate-700">
+            <div className="flex items-center justify-between mb-4">
+              <span className="text-[10px] font-mono text-slate-500 uppercase">{snippet.timestamp.toLocaleTimeString()}</span>
+              <button onClick={() => copyText(snippet.text)} className="opacity-0 group-hover:opacity-100 p-2 bg-slate-800 rounded-full text-slate-400 hover:text-white transition-all">
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3" /></svg>
               </button>
             </div>
-            <p className="text-slate-200 leading-relaxed text-lg font-light">
-              {snippet.text}
-            </p>
+            <p className="text-slate-200 text-xl font-light leading-relaxed tracking-tight">{snippet.text}</p>
           </div>
         ))}
 
-        {/* Real-time Transcription Placeholder */}
+        {/* Active Transcription */}
         {state.isRecording && (
-          <div className="bg-slate-800/80 border-2 border-dashed border-indigo-500/30 rounded-2xl p-5 shadow-inner">
-            <div className="flex items-center gap-2 mb-3">
-              <div className="flex gap-1">
-                <span className="w-1 h-1 bg-indigo-500 rounded-full animate-bounce" style={{animationDelay: '0ms'}}></span>
-                <span className="w-1 h-1 bg-indigo-500 rounded-full animate-bounce" style={{animationDelay: '150ms'}}></span>
-                <span className="w-1 h-1 bg-indigo-500 rounded-full animate-bounce" style={{animationDelay: '300ms'}}></span>
+          <div className="bg-indigo-600/5 border border-indigo-500/30 rounded-3xl p-6 relative overflow-hidden transition-all shadow-[0_0_30px_rgba(79,70,229,0.1)]">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="flex items-center gap-0.5 h-3">
+                {[...Array(4)].map((_, i) => (
+                  <div key={i} className="w-1 bg-indigo-500 rounded-full" style={{ height: `${20 + (voulmeLevel * (200 + i * 50))}%` }} />
+                ))}
               </div>
-              <span className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest">Live Transcription</span>
+              <span className="text-[10px] font-black text-indigo-400 uppercase tracking-widest">Listening</span>
             </div>
-            <p className="text-indigo-100 text-lg leading-relaxed animate-pulse">
-              {state.currentText || 'Listening for your ideas...'}
+            <p className="text-white text-2xl font-medium leading-snug">
+              {state.currentText || <span className="opacity-30 italic">Start speaking your thoughts...</span>}
             </p>
           </div>
         )}
       </main>
 
-      {/* Floating Controls */}
-      <div className="fixed bottom-0 left-0 right-0 p-6 bg-gradient-to-t from-slate-900 via-slate-900 to-transparent pointer-events-none">
-        <div className="max-w-2xl mx-auto flex justify-center pointer-events-auto">
+      {/* Controls */}
+      <div className="fixed bottom-0 left-0 right-0 p-8 flex justify-center bg-gradient-to-t from-[#0a0a0c] via-[#0a0a0c] to-transparent pointer-events-none">
+        <div className="relative pointer-events-auto">
           {!state.isRecording ? (
             <button
-              onClick={startListening}
+              onClick={startSession}
               disabled={state.status === 'connecting'}
-              className={`
-                group relative flex items-center justify-center w-20 h-20 rounded-full bg-indigo-600 hover:bg-indigo-500 shadow-[0_0_30px_rgba(79,70,229,0.3)] hover:shadow-[0_0_40px_rgba(79,70,229,0.5)] transition-all active:scale-95 border-4 border-slate-900 text-white
-                ${state.status === 'connecting' ? 'opacity-70 cursor-wait' : ''}
-              `}
+              className="w-24 h-24 rounded-full bg-white text-black flex items-center justify-center shadow-2xl active:scale-90 transition-all border-[6px] border-[#0a0a0c] disabled:opacity-50"
             >
-              {state.status === 'connecting' ? (
-                <div className="w-8 h-8 border-4 border-white/20 border-t-white rounded-full animate-spin"></div>
-              ) : (
-                <MicrophoneIcon />
-              )}
-              <span className="absolute -top-10 scale-0 group-hover:scale-100 transition-transform bg-slate-800 text-white text-xs py-1 px-3 rounded-full border border-slate-700 whitespace-nowrap shadow-xl">
-                Start Recording
-              </span>
+              <svg className="w-10 h-10" fill="currentColor" viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
             </button>
           ) : (
             <button
-              onClick={stopListening}
-              className="group relative flex items-center justify-center w-20 h-20 rounded-full bg-red-600 hover:bg-red-500 shadow-[0_0_30px_rgba(220,38,38,0.3)] transition-all active:scale-95 border-4 border-slate-900 pulse-animation text-white"
+              onClick={stopSession}
+              className="w-24 h-24 rounded-full bg-red-600 text-white flex items-center justify-center shadow-[0_0_40px_rgba(220,38,38,0.4)] active:scale-90 transition-all border-[6px] border-[#0a0a0c]"
             >
-              <StopIcon />
-              <span className="absolute -top-10 transition-transform bg-slate-800 text-white text-xs py-1 px-3 rounded-full border border-slate-700 whitespace-nowrap shadow-xl">
-                Stop & Save
-              </span>
+              <svg className="w-10 h-10" fill="currentColor" viewBox="0 0 24 24"><path d="M6 6h12v12H6z"/></svg>
             </button>
+          )}
+          
+          {/* External Pulse Ring */}
+          {state.isRecording && (
+             <div className="absolute -inset-4 rounded-full border-2 border-indigo-500/20 animate-ping pointer-events-none" />
           )}
         </div>
       </div>
 
-      {/* Toasts */}
+      {/* Toast */}
       {toast && (
-        <div className="fixed top-20 left-1/2 -translate-x-1/2 bg-slate-800 text-blue-300 px-4 py-2 rounded-full text-xs font-bold border border-blue-500/30 shadow-lg backdrop-blur-md z-50 animate-bounce">
+        <div className="fixed top-8 left-1/2 -translate-x-1/2 bg-white text-black px-6 py-2 rounded-full text-xs font-bold shadow-2xl z-50 transition-all">
           {toast}
         </div>
       )}
 
-      {/* Error Toast */}
+      {/* Error State */}
       {state.status === 'error' && (
-        <div className="fixed top-4 left-1/2 -translate-x-1/2 bg-red-500/90 text-white px-4 py-2 rounded-full text-sm font-medium shadow-lg backdrop-blur-sm z-50">
-          Error connecting to transcription service.
+        <div className="fixed top-0 left-0 right-0 p-3 bg-red-600 text-white text-[10px] font-bold text-center uppercase tracking-widest">
+          Microphone or connection error. Please refresh.
         </div>
       )}
     </div>
