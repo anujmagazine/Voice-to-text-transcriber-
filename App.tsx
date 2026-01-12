@@ -37,6 +37,7 @@ export default function App() {
     isRecording: false,
     status: 'idle',
   });
+  const [toast, setToast] = useState<string | null>(null);
 
   const sessionRef = useRef<any>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -50,6 +51,14 @@ export default function App() {
       historyContainerRef.current.scrollTop = historyContainerRef.current.scrollHeight;
     }
   }, [state.history, state.currentText]);
+
+  // Toast auto-hide
+  useEffect(() => {
+    if (toast) {
+      const timer = setTimeout(() => setToast(null), 2000);
+      return () => clearTimeout(timer);
+    }
+  }, [toast]);
 
   const stopListening = useCallback(async () => {
     if (sessionRef.current) {
@@ -109,7 +118,8 @@ export default function App() {
         config: {
           responseModalities: [Modality.AUDIO],
           inputAudioTranscription: {},
-          systemInstruction: "You are a transcription assistant. Your only job is to provide accurate text of what the user says. Do not respond verbally unless asked. Keep context of ideas.",
+          // Refined instruction to prevent language drift and ensure English transcription when spoken.
+          systemInstruction: "You are a professional transcriptionist. Transcribe the user's speech exactly as spoken in its original language. If the user speaks English, use only English characters and words. Do not translate the speech. Do not switch to Hindi or any other language unless the user explicitly speaks in that language. Only provide the text transcription, no conversational responses or summaries.",
         },
         callbacks: {
           onopen: () => {
@@ -137,10 +147,6 @@ export default function App() {
               transcriptionBuffer.current += text;
               setState(prev => ({ ...prev, currentText: transcriptionBuffer.current }));
             }
-            
-            if (message.serverContent?.turnComplete) {
-              // Usually handled by continuous stream, but we can anchor here if needed.
-            }
           },
           onerror: (e) => {
             console.error('Gemini error:', e);
@@ -162,12 +168,13 @@ export default function App() {
 
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text);
-    // Simple alert-free feedback could be added here
+    setToast('Copied to clipboard');
   };
 
   const clearHistory = () => {
     if (confirm('Clear all captured ideas?')) {
       setState(prev => ({ ...prev, history: [] }));
+      setToast('History cleared');
     }
   };
 
@@ -191,14 +198,14 @@ export default function App() {
             <>
               <button 
                 onClick={copyAll}
-                className="p-2 bg-slate-800 hover:bg-slate-700 rounded-lg transition-colors border border-slate-700"
+                className="p-2 bg-slate-800 hover:bg-slate-700 rounded-lg transition-colors border border-slate-700 text-slate-300"
                 title="Copy All"
               >
                 <CopyIcon />
               </button>
               <button 
                 onClick={clearHistory}
-                className="p-2 bg-slate-800 hover:bg-red-900/40 rounded-lg transition-colors border border-slate-700 hover:border-red-500/50"
+                className="p-2 bg-slate-800 hover:bg-red-900/40 rounded-lg transition-colors border border-slate-700 hover:border-red-500/50 text-slate-300"
                 title="Clear All"
               >
                 <TrashIcon />
@@ -212,7 +219,7 @@ export default function App() {
       <main className="flex-1 overflow-y-auto space-y-4 pr-1 scroll-smooth" ref={historyContainerRef}>
         {state.history.length === 0 && !state.isRecording && (
           <div className="h-full flex flex-col items-center justify-center text-center p-8 space-y-4">
-            <div className="w-20 h-20 bg-slate-800/50 rounded-full flex items-center justify-center border border-slate-700">
+            <div className="w-20 h-20 bg-slate-800/50 rounded-full flex items-center justify-center border border-slate-700 text-slate-400">
               <MicrophoneIcon />
             </div>
             <h2 className="text-xl font-medium text-slate-300">No ideas yet</h2>
@@ -230,7 +237,7 @@ export default function App() {
               </span>
               <button 
                 onClick={() => copyToClipboard(snippet.text)}
-                className="opacity-0 group-hover:opacity-100 p-1.5 text-slate-400 hover:text-white transition-all"
+                className="opacity-0 group-hover:opacity-100 p-1.5 text-slate-400 hover:text-white transition-all bg-slate-700/50 rounded-lg"
               >
                 <CopyIcon />
               </button>
@@ -267,7 +274,7 @@ export default function App() {
               onClick={startListening}
               disabled={state.status === 'connecting'}
               className={`
-                group relative flex items-center justify-center w-20 h-20 rounded-full bg-indigo-600 hover:bg-indigo-500 shadow-[0_0_30px_rgba(79,70,229,0.3)] hover:shadow-[0_0_40px_rgba(79,70,229,0.5)] transition-all active:scale-95 border-4 border-slate-900
+                group relative flex items-center justify-center w-20 h-20 rounded-full bg-indigo-600 hover:bg-indigo-500 shadow-[0_0_30px_rgba(79,70,229,0.3)] hover:shadow-[0_0_40px_rgba(79,70,229,0.5)] transition-all active:scale-95 border-4 border-slate-900 text-white
                 ${state.status === 'connecting' ? 'opacity-70 cursor-wait' : ''}
               `}
             >
@@ -276,23 +283,30 @@ export default function App() {
               ) : (
                 <MicrophoneIcon />
               )}
-              <span className="absolute -top-10 scale-0 group-hover:scale-100 transition-transform bg-slate-800 text-white text-xs py-1 px-3 rounded-full border border-slate-700">
+              <span className="absolute -top-10 scale-0 group-hover:scale-100 transition-transform bg-slate-800 text-white text-xs py-1 px-3 rounded-full border border-slate-700 whitespace-nowrap shadow-xl">
                 Start Recording
               </span>
             </button>
           ) : (
             <button
               onClick={stopListening}
-              className="group flex items-center justify-center w-20 h-20 rounded-full bg-red-600 hover:bg-red-500 shadow-[0_0_30px_rgba(220,38,38,0.3)] transition-all active:scale-95 border-4 border-slate-900 pulse-animation"
+              className="group relative flex items-center justify-center w-20 h-20 rounded-full bg-red-600 hover:bg-red-500 shadow-[0_0_30px_rgba(220,38,38,0.3)] transition-all active:scale-95 border-4 border-slate-900 pulse-animation text-white"
             >
               <StopIcon />
-              <span className="absolute -top-10 transition-transform bg-slate-800 text-white text-xs py-1 px-3 rounded-full border border-slate-700">
+              <span className="absolute -top-10 transition-transform bg-slate-800 text-white text-xs py-1 px-3 rounded-full border border-slate-700 whitespace-nowrap shadow-xl">
                 Stop & Save
               </span>
             </button>
           )}
         </div>
       </div>
+
+      {/* Toasts */}
+      {toast && (
+        <div className="fixed top-20 left-1/2 -translate-x-1/2 bg-slate-800 text-blue-300 px-4 py-2 rounded-full text-xs font-bold border border-blue-500/30 shadow-lg backdrop-blur-md z-50 animate-bounce">
+          {toast}
+        </div>
+      )}
 
       {/* Error Toast */}
       {state.status === 'error' && (
