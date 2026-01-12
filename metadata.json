@@ -1,0 +1,7 @@
+{
+  "name": "IdeaFlow Voice",
+  "description": "A hands-free voice-to-text transcription app designed for capturing ideas while walking or driving, with persistent session history.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
