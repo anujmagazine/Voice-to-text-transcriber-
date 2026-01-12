@@ -5,7 +5,51 @@ import { IdeaSnippet, TranscriptionState } from './types';
 import { encodePCM } from './utils/audioUtils';
 
 const SAMPLE_RATE = 16000;
-const BUFFER_SIZE = 2048;
+const BUFFER_SIZE = 4096;
+
+/**
+ * Advanced Stenography Logic:
+ * This function takes the current master transcript and a new chunk from the AI.
+ * It finds the overlap to ensure words are never duplicated or deleted.
+ */
+function appendVerbatim(master: string, incoming: string): string {
+  if (!incoming) return master;
+  
+  // Clean incoming text: Force Romanized characters only (remove Devanagari/Hindi)
+  // This is a safety filter in case the model ignores system instructions.
+  const cleanedIncoming = incoming.replace(/[^\x00-\x7F]/g, "").trim();
+  if (!cleanedIncoming) return master;
+
+  const masterWords = master.trim().split(/\s+/).filter(w => w.length > 0);
+  const incomingWords = cleanedIncoming.split(/\s+/).filter(w => w.length > 0);
+
+  // If master is empty, just take the incoming
+  if (masterWords.length === 0) return cleanedIncoming;
+
+  // Sliding window to find where incoming overlaps with the end of master.
+  // We check the last 8 words for a match.
+  let overlapIndex = -1;
+  const maxOverlap = Math.min(masterWords.length, incomingWords.length, 8);
+
+  for (let i = maxOverlap; i > 0; i--) {
+    const masterTail = masterWords.slice(-i).join(" ").toLowerCase();
+    const incomingHead = incomingWords.slice(0, i).join(" ").toLowerCase();
+    if (masterTail === incomingHead) {
+      overlapIndex = i;
+      break;
+    }
+  }
+
+  if (overlapIndex !== -1) {
+    // Found overlap, append only the NEW words
+    const uniqueIncoming = incomingWords.slice(overlapIndex).join(" ");
+    return uniqueIncoming ? (master + " " + uniqueIncoming).trim() : master;
+  } else {
+    // No overlap found - this might be a new burst or a pause.
+    // We APPEND it to avoid losing any data.
+    return (master + " " + cleanedIncoming).trim();
+  }
+}
 
 export default function App() {
   const [state, setState] = useState<TranscriptionState>({
@@ -17,26 +61,25 @@ export default function App() {
   
   const [toast, setToast] = useState<string | null>(null);
   const [volume, setVolume] = useState(0);
+  const [wordCount, setWordCount] = useState(0);
 
-  // Core References for high-speed access
   const audioContextRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const activeSessionRef = useRef<any>(null);
-  const historyContainerRef = useRef<HTMLDivElement>(null);
-  const currentTranscriptionRef = useRef<string>('');
+  const liveOutputRef = useRef<HTMLDivElement>(null);
   
-  // Create AI client once
+  // THE MASTER LOG - This is the only source of truth for the session
+  const masterTranscriptRef = useRef<string>('');
+  
   const aiRef = useRef(new GoogleGenAI({ apiKey: process.env.API_KEY || '' }));
 
-  // Auto-scroll logic for history
   useEffect(() => {
-    if (historyContainerRef.current) {
-      historyContainerRef.current.scrollTo({
-        top: historyContainerRef.current.scrollHeight,
-        behavior: 'smooth'
-      });
+    if (liveOutputRef.current) {
+      liveOutputRef.current.scrollTop = liveOutputRef.current.scrollHeight;
     }
-  }, [state.history, state.currentText]);
+    const words = state.currentText.trim().split(/\s+/).filter(w => w.length > 0);
+    setWordCount(words.length);
+  }, [state.currentText]);
 
   const cleanup = useCallback(async () => {
     activeSessionRef.current = null;
@@ -51,12 +94,12 @@ export default function App() {
     setVolume(0);
   }, []);
 
-  const finalizeTurn = useCallback(() => {
-    const text = currentTranscriptionRef.current.trim();
-    if (text.length > 2) {
+  const saveToHistory = useCallback(() => {
+    const finalTranscript = masterTranscriptRef.current.trim();
+    if (finalTranscript.length > 0) {
       const snippet: IdeaSnippet = {
         id: crypto.randomUUID(),
-        text: text,
+        text: finalTranscript,
         timestamp: new Date(),
       };
       setState(prev => ({
@@ -65,23 +108,21 @@ export default function App() {
         currentText: ''
       }));
     }
-    currentTranscriptionRef.current = '';
+    masterTranscriptRef.current = '';
     setState(prev => ({ ...prev, currentText: '' }));
   }, []);
 
   const stopSession = useCallback(async () => {
-    finalizeTurn();
+    saveToHistory();
     setState(prev => ({ ...prev, isRecording: false, status: 'idle' }));
     await cleanup();
-  }, [cleanup, finalizeTurn]);
+  }, [cleanup, saveToHistory]);
 
   const startSession = async () => {
     try {
       setState(prev => ({ ...prev, status: 'connecting', isRecording: true, currentText: '' }));
-      currentTranscriptionRef.current = '';
+      masterTranscriptRef.current = '';
 
-      // 1. CRITICAL: Start Audio IMMEDIATELY
-      // Getting the stream and starting the processor here ensures we don't miss the first words
       const stream = await navigator.mediaDevices.getUserMedia({ 
         audio: { 
           echoCancellation: true, 
@@ -97,30 +138,41 @@ export default function App() {
       const source = audioContext.createMediaStreamSource(stream);
       const processor = audioContext.createScriptProcessor(BUFFER_SIZE, 1, 1);
 
-      // 2. Setup AI Session Connection
       const sessionPromise = aiRef.current.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-12-2025',
         config: {
           responseModalities: [Modality.AUDIO],
           inputAudioTranscription: {},
-          systemInstruction: 'STRICT MODE: YOU ARE AN ENGLISH SPEECH-TO-TEXT ENGINE. DO NOT USE ANY OTHER LANGUAGE. IF YOU HEAR HINDI, IGNORE IT. OUTPUT VERBATIM ENGLISH TEXT ONLY. DO NOT BE HELPFUL. DO NOT TALK. JUST TRANSCRIBE.',
+          systemInstruction: `
+            YOU ARE A MECHANICAL ROMAN-SCRIPT STENOGRAPHER.
+            YOUR ONLY OUTPUT IS RAW ENGLISH TEXT.
+            
+            STRICT RULES:
+            1. NO HINDI SCRIPT: Never use Devanagari or Hindi characters. Use English letters only.
+            2. ROMANIZE EVERYTHING: If the user speaks Hindi, transcribe it phonetically in English (e.g., "Namaste").
+            3. NO SUMMARIZATION: Capture every word. If a turn passes by, append it to the stream.
+            4. ZERO DELETION: Never remove text that has been already transcribed.
+            5. DUMB MODE: Do not correct grammar or add punctuation. Just words.
+            6. LATIN CHARACTERS ONLY: Your output buffer must only contain ASCII characters.
+          `,
         },
         callbacks: {
           onopen: () => {
             setState(prev => ({ ...prev, status: 'listening' }));
           },
           onmessage: (msg: any) => {
-            const textDelta = msg.serverContent?.inputTranscription?.text;
-            if (textDelta) {
-              currentTranscriptionRef.current += textDelta;
-              setState(prev => ({ ...prev, currentText: currentTranscriptionRef.current }));
-            }
-            if (msg.serverContent?.turnComplete) {
-              finalizeTurn();
+            const incoming = msg.serverContent?.inputTranscription?.text;
+            if (incoming) {
+              // Update master transcript with a robust additive logic
+              const updated = appendVerbatim(masterTranscriptRef.current, incoming);
+              if (updated !== masterTranscriptRef.current) {
+                masterTranscriptRef.current = updated;
+                setState(prev => ({ ...prev, currentText: masterTranscriptRef.current }));
+              }
             }
           },
           onerror: (err) => {
-            console.error('Session Error:', err);
+            console.error('Session Link Lost:', err);
             setState(prev => ({ ...prev, status: 'error' }));
             stopSession();
           },
@@ -130,16 +182,12 @@ export default function App() {
         }
       });
 
-      // Update ref when promise resolves for zero-latency direct access
       sessionPromise.then(session => {
         activeSessionRef.current = session;
       });
 
-      // 3. Audio Processing starts NOW - even before the AI handshake completes
       processor.onaudioprocess = (e) => {
         const inputData = e.inputBuffer.getChannelData(0);
-        
-        // Meter logic for UI
         let sum = 0;
         for (let i = 0; i < inputData.length; i++) sum += inputData[i] * inputData[i];
         setVolume(Math.sqrt(sum / inputData.length));
@@ -147,7 +195,6 @@ export default function App() {
         const pcmBase64 = encodePCM(inputData);
         const media = { data: pcmBase64, mimeType: 'audio/pcm;rate=16000' };
 
-        // If session is ready, send directly. If not, queue via the promise.
         if (activeSessionRef.current) {
           activeSessionRef.current.sendRealtimeInput({ media });
         } else {
@@ -162,144 +209,170 @@ export default function App() {
       if (audioContext.state === 'suspended') audioContext.resume();
 
     } catch (err) {
-      console.error('Startup Error:', err);
       setState(prev => ({ ...prev, status: 'error', isRecording: false }));
       cleanup();
     }
   };
 
-  const copy = (text: string) => {
+  const copyText = (text: string) => {
     navigator.clipboard.writeText(text);
-    setToast('COPIED');
-    setTimeout(() => setToast(null), 1500);
+    setToast('COPIED TO CLIPBOARD');
+    setTimeout(() => setToast(null), 2000);
   };
 
   return (
-    <div className="flex flex-col h-screen max-w-xl mx-auto bg-black text-white font-sans overflow-hidden">
-      {/* Dynamic Header */}
-      <header className="p-6 shrink-0 flex justify-between items-center border-b border-white/10 bg-black/80 backdrop-blur-xl z-20">
-        <div>
-          <h1 className="text-2xl font-black italic tracking-tighter text-white">
-            IDEA<span className="text-blue-600">FLOW</span>
-          </h1>
-          <div className="flex items-center gap-2 mt-1">
-            <div className={`w-2 h-2 rounded-full ${state.isRecording ? 'bg-red-500 animate-pulse' : 'bg-white/20'}`} />
-            <span className="text-[10px] font-bold text-white/40 uppercase tracking-widest">
-              {state.status === 'listening' ? 'LIVE STREAM ACTIVE' : state.status === 'connecting' ? 'INITIATING ENGINE' : 'DRIVE SAFE • ENGLISH ONLY'}
-            </span>
+    <div className="flex flex-col h-screen max-w-2xl mx-auto bg-black text-white font-sans overflow-hidden">
+      {/* Precision Header */}
+      <header className="px-8 py-10 shrink-0 flex justify-between items-center border-b border-white/5 bg-black/60 backdrop-blur-3xl z-50">
+        <div className="flex items-center gap-6">
+          <div className="w-16 h-16 rounded-[1.5rem] bg-white text-black flex items-center justify-center shadow-[0_0_50px_rgba(255,255,255,0.1)]">
+            <svg className="w-9 h-9" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}><path strokeLinecap="round" strokeLinejoin="round" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" /></svg>
+          </div>
+          <div>
+            <h1 className="text-3xl font-black tracking-tighter leading-none uppercase italic">Verbatim<span className="text-blue-500">PRO</span></h1>
+            <div className="flex items-center gap-2 mt-2">
+              <span className={`w-2 h-2 rounded-full ${state.isRecording ? 'bg-red-500 animate-pulse' : 'bg-white/10'}`} />
+              <span className="text-[10px] font-black text-white/30 uppercase tracking-[0.4em]">Permanent Log Link</span>
+            </div>
           </div>
         </div>
+        
         {state.history.length > 0 && (
           <button 
-            onClick={() => confirm('Clear history?') && setState(prev => ({ ...prev, history: [] }))}
-            className="p-3 bg-white/5 rounded-xl text-white/40 hover:text-red-500 transition-colors border border-white/5"
+            onClick={() => confirm('Purge history?') && setState(prev => ({ ...prev, history: [] }))}
+            className="w-12 h-12 flex items-center justify-center bg-white/5 rounded-2xl text-white/10 hover:text-red-500 transition-all active:scale-90"
           >
-            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
           </button>
         )}
       </header>
 
-      {/* Main Experience Feed */}
-      <main className="flex-1 overflow-y-auto px-6 py-8 space-y-6 scrollbar-hide" ref={historyContainerRef}>
-        {state.history.length === 0 && !state.isRecording && (
-          <div className="h-full flex flex-col items-center justify-center text-center opacity-30 py-20">
-            <div className="w-24 h-24 mb-6 flex items-center justify-center rounded-full border-2 border-dashed border-white/20">
-              <svg className="w-10 h-10" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 18.5a6.5 6.5 0 100-13 6.5 6.5 0 000 13zM12 18.5v4m-3.5-4l3.5 4 3.5-4" /></svg>
-            </div>
-            <p className="text-sm font-medium">Click the button and speak immediately.</p>
-          </div>
-        )}
-
-        {/* Previous Thoughts */}
-        {state.history.map((snippet) => (
-          <div key={snippet.id} className="animate-in fade-in slide-in-from-bottom-2 duration-400">
-            <div className="bg-[#111114] border border-white/5 rounded-[2.5rem] p-8 transition-all hover:bg-[#16161a] group">
-              <div className="flex justify-between items-start mb-4">
-                <span className="text-[10px] font-black text-blue-500/50 bg-blue-500/5 px-3 py-1 rounded-lg uppercase tracking-wider">
-                  {snippet.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                </span>
-                <button onClick={() => copy(snippet.text)} className="p-2 text-white/20 hover:text-white transition-colors">
-                  <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3" /></svg>
-                </button>
+      {/* Main Stream Content */}
+      <main className="flex-1 overflow-hidden flex flex-col">
+        <div ref={liveOutputRef} className="flex-1 overflow-y-auto px-8 py-10 space-y-12 custom-scrollbar scroll-smooth">
+          
+          {/* Empty Prompt */}
+          {state.history.length === 0 && !state.isRecording && (
+            <div className="h-full flex flex-col items-center justify-center text-center opacity-10">
+              <div className="w-48 h-48 mb-10 rounded-full border-2 border-white/20 border-dashed flex items-center justify-center">
+                <svg className="w-16 h-16" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
               </div>
-              <p className="text-white/90 text-2xl font-light leading-relaxed tracking-tight">
-                {snippet.text}
-              </p>
+              <p className="text-xs font-black uppercase tracking-[1em]">Engine Idle</p>
             </div>
-          </div>
-        ))}
+          )}
 
-        {/* Live Streaming Indicator */}
-        {state.isRecording && (
-          <div className="bg-blue-600/10 border-2 border-blue-500/30 rounded-[3rem] p-10 relative overflow-hidden shadow-2xl animate-in zoom-in-95 duration-150">
-            <div className="flex items-center gap-4 mb-8">
-              <div className="flex items-end gap-1.5 h-6">
-                {[...Array(8)].map((_, i) => (
-                  <div 
-                    key={i} 
-                    className="w-1.5 bg-blue-500 rounded-full transition-all duration-75"
-                    style={{ height: `${20 + (volume * (500 + i * 150))}%`, opacity: 0.2 + (volume * 4) }}
-                  />
-                ))}
+          {/* Historical Logs */}
+          {state.history.map((snippet) => (
+            <div key={snippet.id} className="animate-in fade-in slide-in-from-bottom-10 duration-500">
+              <div className="bg-[#080808] border border-white/5 rounded-[3rem] p-12 relative group shadow-2xl overflow-hidden">
+                <div className="absolute top-0 right-0 p-8 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <button onClick={() => copyText(snippet.text)} className="p-4 bg-white/5 rounded-2xl text-blue-500 hover:bg-blue-500 hover:text-white transition-all">
+                    <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3" /></svg>
+                  </button>
+                </div>
+                <div className="flex items-center gap-4 mb-10 text-[10px] font-black tracking-widest uppercase">
+                   <span className="text-white/40">Session Log</span>
+                   <span className="w-1 h-1 rounded-full bg-white/10" />
+                   <span className="text-blue-500/60">{snippet.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                </div>
+                <p className="text-white/90 text-4xl font-light leading-snug tracking-tighter selection:bg-blue-600/30">
+                  {snippet.text}
+                </p>
               </div>
-              <span className="text-xs font-black text-blue-400 uppercase tracking-[0.4em] animate-pulse">Capturing Live</span>
             </div>
-            <p className="text-white text-3xl font-bold leading-tight min-h-[5rem]">
-              {state.currentText || <span className="text-white/10 italic">Capturing from the start...</span>}
-            </p>
-          </div>
-        )}
+          ))}
+
+          {/* THE LIVE RUNNING BUFFER */}
+          {state.isRecording && (
+            <div className="animate-in slide-in-from-bottom-16 duration-700">
+              <div className="bg-[#030303] border-4 border-white/5 rounded-[4rem] p-14 shadow-[0_0_150px_rgba(59,130,246,0.15)] relative overflow-hidden">
+                <div className="flex items-center justify-between mb-12 border-b border-white/5 pb-12">
+                  <div className="flex items-center gap-6">
+                    <div className="flex items-end gap-2 h-12">
+                      {[...Array(14)].map((_, i) => (
+                        <div 
+                          key={i} 
+                          className="w-2 bg-blue-600 rounded-full transition-all duration-75"
+                          style={{ height: `${20 + (volume * (2500 + i * 400))}%`, opacity: 0.2 + (volume * 10) }}
+                        />
+                      ))}
+                    </div>
+                    <div>
+                      <span className="text-xs font-black text-blue-500 uppercase tracking-[0.6em] animate-pulse">Capturing Live Stream</span>
+                      <p className="text-[10px] font-bold text-white/20 uppercase tracking-[0.3em] mt-2">{wordCount} words recorded in Roman script</p>
+                    </div>
+                  </div>
+                  <div className="w-6 h-6 rounded-full bg-red-600 animate-ping shadow-[0_0_30px_rgba(220,38,38,0.4)]" />
+                </div>
+                
+                <div className="text-white text-6xl font-black leading-[1.2] whitespace-pre-wrap tracking-tighter transition-all duration-300">
+                  {state.currentText || <span className="text-white/5 font-normal italic">Speak Romanized...</span>}
+                  <span className="inline-block w-3 h-16 bg-blue-600 ml-4 animate-pulse align-middle rounded-full shadow-[0_0_20px_rgba(37,99,235,1)]" />
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
       </main>
 
-      {/* Primary Control */}
-      <footer className="p-12 shrink-0 flex justify-center bg-gradient-to-t from-black via-black to-transparent relative z-30">
-        <div className="relative">
+      {/* Control Station */}
+      <footer className="p-16 shrink-0 flex flex-col items-center bg-gradient-to-t from-black via-black to-transparent relative z-50">
+        <div className="relative group">
           {!state.isRecording ? (
             <button
               onClick={startSession}
               disabled={state.status === 'connecting'}
-              className="w-32 h-32 rounded-full bg-white text-black flex items-center justify-center shadow-[0_0_60px_rgba(255,255,255,0.15)] active:scale-90 transition-all border-[12px] border-black disabled:opacity-50 group"
+              className="w-40 h-40 rounded-full bg-white text-black flex items-center justify-center shadow-[0_0_150px_rgba(255,255,255,0.1)] active:scale-90 transition-all border-[20px] border-black hover:scale-105 disabled:opacity-50"
             >
-              <svg className="w-12 h-12 transition-transform group-hover:scale-110" fill="currentColor" viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
+              <svg className="w-16 h-16" fill="currentColor" viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
             </button>
           ) : (
             <button
               onClick={stopSession}
-              className="w-32 h-32 rounded-full bg-red-600 text-white flex items-center justify-center shadow-[0_0_60px_rgba(220,38,38,0.2)] active:scale-90 transition-all border-[12px] border-black relative z-10"
+              className="w-40 h-40 rounded-full bg-red-600 text-white flex items-center justify-center shadow-[0_0_150px_rgba(220,38,38,0.4)] active:scale-90 transition-all border-[20px] border-black relative z-10"
             >
-              <svg className="w-12 h-12" fill="currentColor" viewBox="0 0 24 24"><path d="M6 6h12v12H6z"/></svg>
+              <svg className="w-20 h-20" fill="currentColor" viewBox="0 0 24 24"><path d="M6 6h12v12H6z"/></svg>
             </button>
           )}
           
-          {/* Reactive Energy Ring */}
+          {/* REACTIVE ENERGY CORE */}
           {state.isRecording && (
             <div 
-              className="absolute inset-0 rounded-full bg-blue-500/20 -z-10 transition-transform duration-75"
-              style={{ transform: `scale(${1.2 + volume * 15})` }}
+              className="absolute inset-0 rounded-full bg-blue-600/20 -z-10 transition-transform duration-75 blur-[150px]"
+              style={{ transform: `scale(${1.8 + volume * 40})` }}
             />
           )}
         </div>
+        
+        <p className="mt-12 text-[11px] font-black text-white/10 uppercase tracking-[0.7em]">
+          {state.isRecording ? 'Capturing Verbatim' : 'Initialize Monologue Link'}
+        </p>
       </footer>
 
-      {/* Copy Notification */}
+      {/* Copy Alerts */}
       {toast && (
-        <div className="fixed top-12 left-1/2 -translate-x-1/2 bg-white text-black px-8 py-3 rounded-full text-xs font-black shadow-2xl z-[100] animate-in slide-in-from-top-4">
+        <div className="fixed top-16 left-1/2 -translate-x-1/2 bg-blue-600 text-white px-16 py-7 rounded-full text-[10px] font-black shadow-[0_50px_100px_rgba(0,0,0,0.8)] z-[100] animate-in slide-in-from-top-20 border border-blue-400/30 tracking-[0.4em] uppercase">
           {toast}
         </div>
       )}
 
-      {/* Error View */}
+      {/* Error Logic */}
       {state.status === 'error' && (
-        <div className="fixed inset-0 bg-red-600/95 backdrop-blur-xl flex flex-col items-center justify-center p-12 text-center z-[200]">
-          <h2 className="text-3xl font-black mb-4 uppercase tracking-tighter">Link Disconnected</h2>
-          <p className="text-white/60 mb-10 text-sm font-medium">Verify your network and microphone permissions.</p>
-          <button onClick={() => window.location.reload()} className="px-12 py-5 bg-white text-red-600 rounded-full font-black uppercase text-xs tracking-widest">Restore Link</button>
+        <div className="fixed inset-0 bg-black flex flex-col items-center justify-center p-20 text-center z-[200] animate-in fade-in duration-1000">
+          <div className="w-32 h-32 bg-red-600/10 text-red-600 rounded-[3.5rem] flex items-center justify-center mb-14 border border-red-600/20">
+             <svg className="w-16 h-16" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
+          </div>
+          <h2 className="text-5xl font-black mb-8 tracking-tighter uppercase italic">Link Broken</h2>
+          <p className="text-white/40 mb-20 text-xl font-medium max-w-[400px] mx-auto leading-relaxed italic opacity-60">The Roman-script buffer was disconnected. Check signal strength and reconnect.</p>
+          <button onClick={() => window.location.reload()} className="px-24 py-8 bg-white text-black rounded-full font-black uppercase text-xs tracking-[0.6em] active:scale-95 transition-all shadow-2xl">Establish Re-Sync</button>
         </div>
       )}
 
       <style>{`
-        .scrollbar-hide::-webkit-scrollbar { display: none; }
-        .scrollbar-hide { -ms-overflow-style: none; scrollbar-width: none; }
+        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(59, 130, 246, 0.2); border-radius: 10px; }
+        .custom-scrollbar { scrollbar-width: thin; scrollbar-color: rgba(59, 130, 246, 0.1) transparent; }
       `}</style>
     </div>
   );
