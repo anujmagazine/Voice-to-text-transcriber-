@@ -3,7 +3,9 @@ export function encodePCM(data: Float32Array): string {
   const l = data.length;
   const int16 = new Int16Array(l);
   for (let i = 0; i < l; i++) {
-    int16[i] = Math.max(-1, Math.min(1, data[i])) * 0x7FFF;
+    // Clamp and convert to 16-bit PCM
+    const s = Math.max(-1, Math.min(1, data[i]));
+    int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
   }
   return encodeBase64(new Uint8Array(int16.buffer));
 }
