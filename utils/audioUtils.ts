@@ -3,10 +3,12 @@ export function encodePCM(data: Float32Array): string {
   const l = data.length;
   const int16 = new Int16Array(l);
   for (let i = 0; i < l; i++) {
-    // Clamp and convert to 16-bit PCM
+    // Clamp the value between -1.0 and 1.0
     const s = Math.max(-1, Math.min(1, data[i]));
+    // Convert Float32 (-1 to 1) to Int16 (-32768 to 32767)
     int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
   }
+  // Convert binary Int16 buffer to Base64 string for the API JSON payload
   return encodeBase64(new Uint8Array(int16.buffer));
 }
 
