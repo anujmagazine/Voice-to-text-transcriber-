@@ -1,6 +1,6 @@
 {
   "name": "Digital Stenographer",
-  "description": "A hands-free voice-to-text transcription app designed for capturing ideas while walking or driving, with persistent session history.",
+  "description": "Simple hands-free voice-to-text for capturing ideas on the go.",
   "requestFramePermissions": [
     "microphone"
   ]

@@ -206,7 +206,7 @@ export default function App() {
             <h1 className="text-2xl font-black tracking-tight leading-none uppercase italic">Digital<span className="text-blue-500">Stenographer</span></h1>
             <div className="flex items-center gap-2 mt-2">
               <span className={`w-2 h-2 rounded-full ${state.isRecording ? 'bg-red-500 animate-pulse' : 'bg-white/10'}`} />
-              <span className="text-[10px] font-black text-white/30 uppercase tracking-[0.3em]">Mechanical Verbatim Voice Logger</span>
+              <span className="text-[10px] font-black text-white/30 uppercase tracking-[0.3em]">Hands-free idea capture</span>
             </div>
           </div>
         </div>
@@ -229,7 +229,7 @@ export default function App() {
           {state.history.length === 0 && !state.isRecording && (
             <div className="h-full flex flex-col items-center justify-center text-center opacity-10">
               <div className="w-36 h-36 mb-8 rounded-full border-2 border-white/10 border-dashed flex items-center justify-center">
-                <svg className="w-12 h-12" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+                <svg className="w-12 h-12" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
               </div>
               <p className="text-[9px] font-black uppercase tracking-[0.8em]">Awaiting Voice Link</p>
             </div>
