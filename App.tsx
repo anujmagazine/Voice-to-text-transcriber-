@@ -229,10 +229,10 @@ export default function App() {
             <svg className="w-9 h-9" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}><path strokeLinecap="round" strokeLinejoin="round" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" /></svg>
           </div>
           <div>
-            <h1 className="text-3xl font-black tracking-tighter leading-none uppercase italic">Verbatim<span className="text-blue-500">PRO</span></h1>
+            <h1 className="text-3xl font-black tracking-tighter leading-none uppercase italic">Digital<span className="text-blue-500">Stenographer</span></h1>
             <div className="flex items-center gap-2 mt-2">
               <span className={`w-2 h-2 rounded-full ${state.isRecording ? 'bg-red-500 animate-pulse' : 'bg-white/10'}`} />
-              <span className="text-[10px] font-black text-white/30 uppercase tracking-[0.4em]">Permanent Log Link</span>
+              <span className="text-[10px] font-black text-white/30 uppercase tracking-[0.4em]">Mechanical Verbatim Voice Logger</span>
             </div>
           </div>
         </div>
@@ -275,7 +275,7 @@ export default function App() {
                    <span className="w-1 h-1 rounded-full bg-white/10" />
                    <span className="text-blue-500/60">{snippet.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                 </div>
-                <p className="text-white/90 text-4xl font-light leading-snug tracking-tighter selection:bg-blue-600/30">
+                <p className="text-white/90 text-2xl font-light leading-snug tracking-tighter selection:bg-blue-600/30">
                   {snippet.text}
                 </p>
               </div>
@@ -299,15 +299,15 @@ export default function App() {
                     </div>
                     <div>
                       <span className="text-xs font-black text-blue-500 uppercase tracking-[0.6em] animate-pulse">Capturing Live Stream</span>
-                      <p className="text-[10px] font-bold text-white/20 uppercase tracking-[0.3em] mt-2">{wordCount} words recorded in Roman script</p>
+                      <p className="text-[10px] font-bold text-white/20 uppercase tracking-[0.3em] mt-2">{wordCount} words recorded</p>
                     </div>
                   </div>
                   <div className="w-6 h-6 rounded-full bg-red-600 animate-ping shadow-[0_0_30px_rgba(220,38,38,0.4)]" />
                 </div>
                 
-                <div className="text-white text-6xl font-black leading-[1.2] whitespace-pre-wrap tracking-tighter transition-all duration-300">
+                <div className="text-white text-4xl font-black leading-[1.2] whitespace-pre-wrap tracking-tighter transition-all duration-300">
                   {state.currentText || <span className="text-white/5 font-normal italic">Speak Romanized...</span>}
-                  <span className="inline-block w-3 h-16 bg-blue-600 ml-4 animate-pulse align-middle rounded-full shadow-[0_0_20px_rgba(37,99,235,1)]" />
+                  <span className="inline-block w-3 h-10 bg-blue-600 ml-4 animate-pulse align-middle rounded-full shadow-[0_0_20px_rgba(37,99,235,1)]" />
                 </div>
               </div>
             </div>
