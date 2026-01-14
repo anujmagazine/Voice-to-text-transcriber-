@@ -2,16 +2,16 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { GoogleGenAI, Modality } from '@google/genai';
 import { IdeaSnippet, TranscriptionState } from './types';
-import { encodePCM } from './utils/audioUtils';
+import { encodePCM, downsampleBuffer } from './utils/audioUtils';
 
 const SAMPLE_RATE = 16000;
 const BUFFER_SIZE = 4096;
 
 /**
- * Filter to strip non-ASCII characters (e.g., Hindi Devanagari) 
- * to ensure verbatim Romanized logging.
+ * Forcefully strips all non-ASCII characters. 
+ * This effectively blocks Devanagari, emojis, and other non-Roman scripts.
  */
-function stripNonRoman(text: string): string {
+function sanitizeText(text: string): string {
   return text.replace(/[^\x00-\x7F]/g, "");
 }
 
@@ -61,8 +61,10 @@ export default function App() {
   }, []);
 
   const saveToHistory = useCallback(() => {
-    // Combine everything into a final block
-    const finalTranscript = (permanentTranscriptRef.current + " " + turnDeltaRef.current).trim();
+    // Sanitize the final block one last time before saving
+    const combined = (permanentTranscriptRef.current + " " + turnDeltaRef.current).trim();
+    const finalTranscript = sanitizeText(combined);
+    
     if (finalTranscript.length > 0) {
       const snippet: IdeaSnippet = {
         id: crypto.randomUUID(),
@@ -101,27 +103,26 @@ export default function App() {
       });
       streamRef.current = stream;
 
-      // Ensure 16kHz resampling for the AI model
       const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: SAMPLE_RATE });
       audioContextRef.current = audioContext;
+      const actualSampleRate = audioContext.sampleRate;
       
       const source = audioContext.createMediaStreamSource(stream);
-      // Processor to handle raw audio samples
       const processor = audioContext.createScriptProcessor(BUFFER_SIZE, 1, 1);
 
       const sessionPromise = aiRef.current.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-12-2025',
         config: {
           responseModalities: [Modality.AUDIO],
-          inputAudioTranscription: {}, // Request real-time transcription of user audio
+          inputAudioTranscription: {},
           systemInstruction: `
             IDENTITY: MECHANICAL DIGITAL STENOGRAPHER.
-            MISSION: VERBATIM VOICE-LOGGING.
-            RULES:
-            1. ROMAN SCRIPT ONLY: Use Latin characters (A-Z) for all output. 
-            2. NO HINDI SCRIPT: Never use Devanagari characters. If Hindi is spoken, write it phonetically in English.
-            3. ADDITIVE DELTAS: Output transcription as soon as words are identified.
-            4. ZERO EDITING: Do not summarize or correct. Capture exactly what is heard.
+            STRICT BEHAVIORAL PROTOCOLS:
+            1. ROMAN CHARACTERS ONLY: Output ONLY Latin/Roman characters (A-Z, a-z, 0-9). 
+            2. NO NON-LATIN SCRIPTS: NEVER use Devanagari, Hindi, or any non-ASCII script.
+            3. PHONETIC Romanization: If non-English speech is heard, transcribe it using English letters (e.g. write "Namaste", not Hindi characters).
+            4. IGNORE DISTURBANCES: Do NOT transcribe sneezes, coughs, background noise, or non-speech sounds. If a sound is not clearly human speech, omit it.
+            5. VERBATIM: Do not summarize. Do not edit. Capture exactly what is spoken.
           `,
         },
         callbacks: {
@@ -129,19 +130,18 @@ export default function App() {
             setState(prev => ({ ...prev, status: 'listening' }));
           },
           onmessage: (msg: any) => {
-            // Correct Delta Event Parsing
             if (msg.serverContent?.inputTranscription) {
-              const delta = msg.serverContent.inputTranscription.text;
+              // Sanitize the incoming delta immediately
+              const delta = sanitizeText(msg.serverContent.inputTranscription.text);
               turnDeltaRef.current += delta;
               
               const fullText = (permanentTranscriptRef.current + " " + turnDeltaRef.current).trim();
-              // Apply Roman-only filter to display
-              setState(prev => ({ ...prev, currentText: stripNonRoman(fullText) }));
+              setState(prev => ({ ...prev, currentText: fullText }));
             }
 
-            // Lock current turn into permanent memory when turn finishes
             if (msg.serverContent?.turnComplete) {
-              permanentTranscriptRef.current = (permanentTranscriptRef.current + " " + turnDeltaRef.current).trim();
+              // Sanitize before moving to permanent buffer
+              permanentTranscriptRef.current = sanitizeText((permanentTranscriptRef.current + " " + turnDeltaRef.current).trim());
               turnDeltaRef.current = '';
             }
           },
@@ -161,17 +161,18 @@ export default function App() {
       });
 
       processor.onaudioprocess = (e) => {
-        const inputData = e.inputBuffer.getChannelData(0);
-        // Compute volume for the visualization ring
+        let inputData = e.inputBuffer.getChannelData(0);
         let sum = 0;
         for (let i = 0; i < inputData.length; i++) sum += inputData[i] * inputData[i];
         setVolume(Math.sqrt(sum / inputData.length));
 
-        // Binary PCM -> Base64 pipeline
+        if (actualSampleRate !== SAMPLE_RATE) {
+          inputData = downsampleBuffer(inputData, actualSampleRate, SAMPLE_RATE);
+        }
+
         const pcmBase64 = encodePCM(inputData);
         const media = { data: pcmBase64, mimeType: 'audio/pcm;rate=16000' };
 
-        // Send to Live API via WebSocket session
         sessionPromise.then(session => {
           session.sendRealtimeInput({ media });
         });
@@ -196,7 +197,6 @@ export default function App() {
 
   return (
     <div className="flex flex-col h-screen max-w-2xl mx-auto bg-black text-white font-sans overflow-hidden">
-      {/* Precision Header */}
       <header className="px-8 py-10 shrink-0 flex justify-between items-center border-b border-white/5 bg-black/80 backdrop-blur-2xl z-50">
         <div className="flex items-center gap-5">
           <div className="w-14 h-14 rounded-2xl bg-blue-600 text-white flex items-center justify-center shadow-lg shadow-blue-500/20">
@@ -221,11 +221,8 @@ export default function App() {
         )}
       </header>
 
-      {/* Main Stream Content */}
       <main className="flex-1 overflow-hidden flex flex-col">
         <div ref={liveOutputRef} className="flex-1 overflow-y-auto px-8 py-8 space-y-8 custom-scrollbar scroll-smooth">
-          
-          {/* Empty Prompt */}
           {state.history.length === 0 && !state.isRecording && (
             <div className="h-full flex flex-col items-center justify-center text-center opacity-10">
               <div className="w-36 h-36 mb-8 rounded-full border-2 border-white/10 border-dashed flex items-center justify-center">
@@ -235,7 +232,6 @@ export default function App() {
             </div>
           )}
 
-          {/* Historical Logs */}
           {state.history.map((snippet) => (
             <div key={snippet.id} className="animate-in fade-in slide-in-from-bottom-4 duration-500">
               <div className="bg-[#0a0a0a] border border-white/5 rounded-[2rem] p-8 relative group shadow-sm">
@@ -248,7 +244,6 @@ export default function App() {
                    <span className="text-white/20">Archived Session</span>
                    <span className="text-blue-500/40">{snippet.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                 </div>
-                {/* Reduced font size for history as requested */}
                 <p className="text-white/60 text-lg font-normal leading-relaxed tracking-tight">
                   {snippet.text}
                 </p>
@@ -256,7 +251,6 @@ export default function App() {
             </div>
           ))}
 
-          {/* THE LIVE RUNNING BUFFER */}
           {state.isRecording && (
             <div className="animate-in slide-in-from-bottom-6 duration-500">
               <div className="bg-[#030303] border-2 border-white/5 rounded-[2.5rem] p-8 shadow-2xl relative overflow-hidden">
@@ -279,7 +273,6 @@ export default function App() {
                   <div className="w-2.5 h-2.5 rounded-full bg-red-600 animate-ping shadow-sm" />
                 </div>
                 
-                {/* Reduced font size for live text as requested */}
                 <div className="text-white text-xl font-bold leading-relaxed tracking-tight transition-all duration-300">
                   {state.currentText || <span className="text-white/5 font-normal italic">Initialize voice input...</span>}
                   <span className="inline-block w-1.5 h-6 bg-blue-600 ml-2 animate-pulse align-middle rounded-full" />
@@ -290,7 +283,6 @@ export default function App() {
         </div>
       </main>
 
-      {/* Footer Interface */}
       <footer className="p-10 shrink-0 flex flex-col items-center bg-gradient-to-t from-black via-black to-transparent relative z-50">
         <div className="relative group">
           {!state.isRecording ? (
@@ -310,7 +302,6 @@ export default function App() {
             </button>
           )}
           
-          {/* Sonic Field Effect */}
           {state.isRecording && (
             <div 
               className="absolute inset-0 rounded-full bg-blue-600/10 -z-10 transition-transform duration-75 blur-[70px]"
@@ -324,14 +315,12 @@ export default function App() {
         </p>
       </footer>
 
-      {/* Copy Notification */}
       {toast && (
         <div className="fixed top-12 left-1/2 -translate-x-1/2 bg-blue-600 text-white px-8 py-3 rounded-full text-[8px] font-black shadow-2xl z-[100] animate-in slide-in-from-top-12 border border-blue-400/10 tracking-[0.2em] uppercase">
           {toast}
         </div>
       )}
 
-      {/* Recovery Overlay */}
       {state.status === 'error' && (
         <div className="fixed inset-0 bg-black/95 flex flex-col items-center justify-center p-16 text-center z-[200] animate-in fade-in duration-500 backdrop-blur-xl">
           <div className="w-16 h-16 bg-red-600/10 text-red-600 rounded-2xl flex items-center justify-center mb-10 border border-red-600/10 shadow-sm">

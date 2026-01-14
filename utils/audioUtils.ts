@@ -1,4 +1,16 @@
 
+export function downsampleBuffer(buffer: Float32Array, inputRate: number, outputRate: number): Float32Array {
+  if (inputRate === outputRate) return buffer;
+  const ratio = inputRate / outputRate;
+  const newLength = Math.ceil(buffer.length / ratio);
+  const result = new Float32Array(newLength);
+  for (let i = 0; i < newLength; i++) {
+    // Simple nearest-neighbor resampling for efficiency in real-time capture
+    result[i] = buffer[Math.floor(i * ratio)];
+  }
+  return result;
+}
+
 export function encodePCM(data: Float32Array): string {
   const l = data.length;
   const int16 = new Int16Array(l);
